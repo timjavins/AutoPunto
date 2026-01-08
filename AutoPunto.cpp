@@ -1,3 +1,5 @@
+#define UNICODE
+#define _UNICODE
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <windowsx.h>
@@ -30,6 +32,7 @@ static HWND   g_hTrayWnd      = nullptr; // same as main
 static HWND   g_hOverlayWnd   = nullptr; // [ / ] overlay
 
 static HINSTANCE g_hInst      = nullptr;
+static HICON g_hAppIcon       = nullptr;
 
 static std::mt19937_64 g_Rng((unsigned)time(nullptr));
 
@@ -56,12 +59,24 @@ static std::atomic<bool> g_Running{true};
 #define ID_LABEL_CPS   3002
 #define ID_LABEL_STATUS 3003
 
+// Timer ID for confirmation overlay
+#define ID_TIMER_CONFIRM_OVERLAY 4001
+
+// Confirmation overlay window
+static HWND g_hConfirmOverlayWnd = nullptr;
+static bool g_ConfirmOverlayClassRegistered = false;
+static std::wstring g_ConfirmText = L"";
+
 // Label handles
 static HWND g_hLabelCPS    = nullptr;
 static HWND g_hLabelStatus = nullptr;
 
 // Log mutex
 static std::mutex g_LogMutex;
+
+// Overlay window class registration
+static bool g_OverlayClassRegistered = false;
+WNDCLASSW wc = {}; // Initialize wc globally
 
 // --------------------------------------------------
 // Logging helper
@@ -197,6 +212,100 @@ void CreateOverlayWindow(HWND hParent) {
     // Don't show initially - only show when clicking
 }
 
+// --------------------------------------------------
+// Confirmation Overlay (shows mode change, auto-hides after 1 second)
+// --------------------------------------------------
+LRESULT CALLBACK ConfirmOverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        
+        // Semi-transparent dark background
+        HBRUSH hBrush = CreateSolidBrush(RGB(40, 40, 40));
+        FillRect(hdc, &rc, hBrush);
+        DeleteObject(hBrush);
+        
+        // White text
+        SetTextColor(hdc, RGB(255, 255, 255));
+        SetBkMode(hdc, TRANSPARENT);
+        
+        HFONT hFont = CreateFontW(24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ hOld = SelectObject(hdc, hFont);
+        
+        DrawTextW(hdc, g_ConfirmText.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        
+        SelectObject(hdc, hOld);
+        DeleteObject(hFont);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_TIMER:
+        if (wParam == ID_TIMER_CONFIRM_OVERLAY) {
+            KillTimer(hwnd, ID_TIMER_CONFIRM_OVERLAY);
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void CreateConfirmOverlayWindow() {
+    if (g_hConfirmOverlayWnd) return;
+
+    if (!g_ConfirmOverlayClassRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = ConfirmOverlayWndProc;
+        wc.hInstance     = g_hInst;
+        wc.lpszClassName = L"ConfirmOverlayClass";
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        if (RegisterClassW(&wc)) {
+            g_ConfirmOverlayClassRegistered = true;
+        }
+    }
+
+    int width  = 200;
+    int height = 50;
+
+    // Top-center of primary monitor
+    RECT rc;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &rc, 0);
+    int x = (rc.right - rc.left) / 2 - width / 2;
+    int y = rc.top + 100;
+
+    g_hConfirmOverlayWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"ConfirmOverlayClass",
+        L"",
+        WS_POPUP,
+        x, y, width, height,
+        nullptr,
+        nullptr,
+        g_hInst,
+        nullptr
+    );
+}
+
+void ShowConfirmOverlay(const wchar_t* text) {
+    if (!g_hConfirmOverlayWnd)
+        CreateConfirmOverlayWindow();
+
+    if (g_hConfirmOverlayWnd) {
+        g_ConfirmText = text;
+        InvalidateRect(g_hConfirmOverlayWnd, nullptr, TRUE);
+        ShowWindow(g_hConfirmOverlayWnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(g_hConfirmOverlayWnd);
+        
+        // Set timer to hide after 1 second (1000ms)
+        SetTimer(g_hConfirmOverlayWnd, ID_TIMER_CONFIRM_OVERLAY, 1000, nullptr);
+    }
+}
+
 void ShowClickOverlay() {
     if (!g_hOverlayWnd && g_hMainWnd)
         CreateOverlayWindow(g_hMainWnd);
@@ -284,8 +393,11 @@ void AddTrayIcon(HWND hwnd) {
     nid.uID = ID_TRAYICON;
     nid.uVersion = NOTIFYICON_VERSION_4;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wcscpy_s(nid.szTip, L"AutoClicker C++");
+    nid.hIcon = g_hAppIcon ? g_hAppIcon : LoadIcon(nullptr, IDI_APPLICATION);
+
+    // Ensure destination buffer is wchar_t and pass buffer size explicitly
+    wcscpy_s(nid.szTip, sizeof(nid.szTip) / sizeof(wchar_t), L"MuchoPunto");
+
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     Shell_NotifyIcon(NIM_ADD, &nid);
 }
@@ -304,7 +416,7 @@ void RemoveTrayIcon(HWND hwnd) {
 void UpdateCPSLabel() {
     if (g_hLabelCPS) {
         wchar_t buf[32];
-        swprintf_s(buf, L"CPS: %d", g_CPS);
+        swprintf_s(buf, L"CPS: %d", g_CPS.load()); // Use .load() to retrieve the value
         SetWindowTextW(g_hLabelCPS, buf);
     }
 }
@@ -400,15 +512,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             UpdateStatusLabel();
             std::string s = std::string("F13 toggle mode -> ") + (g_ToggleMode ? "ON" : "OFF");
             Log(s);
+            ShowConfirmOverlay(g_ToggleMode ? L"Toggle: ON" : L"Toggle: OFF");
         } else if (wParam == ID_HOTKEY_F14) {
             g_HoldMode = !g_HoldMode;
             g_ToggleMode = false;
             UpdateStatusLabel();
             std::string s = std::string("F14 hold mode -> ") + (g_HoldMode ? "ON" : "OFF");
             Log(s);
+            ShowConfirmOverlay(g_HoldMode ? L"Hold: ON" : L"Hold: OFF");
         }
         return 0;
     }
+
+    case WM_SYSCOMMAND:
+        if (wParam == SC_MINIMIZE) {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        break;
 
     case WM_CLOSE:
         // X button closes the GUI and exits autoclicker
@@ -429,15 +550,26 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     QueryPerformanceFrequency(&g_Freq);
     g_NextClickTime = NowSeconds();
 
+    // Load custom icon from executable directory
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = L'\0';
+        wcscat_s(exePath, L"MuchoPunto.ico");
+        g_hAppIcon = (HICON)LoadImageW(nullptr, exePath,
+            IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+    }
+
     // Main window (hidden initially, shows GUI when tray icon dbl-clicked)
-    const wchar_t CLASS_NAME[] = L"AutoClickerMainWndClass";
+    const wchar_t CLASS_NAME[] = L"MuchoPuntoMainWndClass";
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc   = MainWndProc;
     wc.hInstance     = hInstance;
     wc.lpszClassName = CLASS_NAME;
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon         = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon         = g_hAppIcon ? g_hAppIcon : LoadIcon(nullptr, IDI_APPLICATION);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
 
     RegisterClassW(&wc);
@@ -445,8 +577,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_hMainWnd = CreateWindowExW(
         0,
         CLASS_NAME,
-        L"AutoClicker Control Panel",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        L"MuchoPunto Control Panel",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 300, 150,
         nullptr,
         nullptr,
@@ -497,14 +629,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     UnregisterHotKey(g_hMainWnd, ID_HOTKEY_F14);
     RemoveTrayIcon(g_hTrayWnd);
 
+    // Cleanup overlay window
     if (g_hOverlayWnd) {
         DestroyWindow(g_hOverlayWnd);
         g_hOverlayWnd = nullptr;
     }
 
-
-
-
-}    return 0;    DestroyWindow(g_hMainWnd);
+    DestroyWindow(g_hMainWnd);
     return 0;
 }

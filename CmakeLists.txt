@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Add the source file
-add_executable(AutoPunto AutoPunto.cpp)
+add_executable(AutoPunto WIN32 AutoPunto.cpp)
 
 # Link required libraries
 target_link_libraries(AutoPunto user32 gdi32 shell32 comctl32)
