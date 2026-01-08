@@ -8,6 +8,8 @@
 #include <string>
 #include <sstream>
 #include <random>
+#include <atomic>
+#include <mutex>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -17,11 +19,11 @@
 // --------------------------------------------------
 // CONFIGURATION
 // --------------------------------------------------
-static int    g_CPS           = 12;
+static std::atomic<int>  g_CPS{12};
 static double g_RandomFactor  = 0.20;
 
-static bool   g_ToggleMode    = false; // F13
-static bool   g_HoldMode      = false; // F14
+static std::atomic<bool> g_ToggleMode{false}; // F13
+static std::atomic<bool> g_HoldMode{false};   // F14
 
 static HWND   g_hMainWnd      = nullptr; // GUI with slider
 static HWND   g_hTrayWnd      = nullptr; // same as main
@@ -39,7 +41,7 @@ static wchar_t g_OverlayChar = L'[';
 
 // Worker thread control
 static HANDLE g_hClickThread = nullptr;
-static bool   g_Running      = true;
+static std::atomic<bool> g_Running{true};
 
 // Tray icon ID
 #define WM_TRAYICON (WM_APP + 1)
@@ -51,11 +53,22 @@ static bool   g_Running      = true;
 
 // Slider control ID
 #define ID_SLIDER_CPS  3001
+#define ID_LABEL_CPS   3002
+#define ID_LABEL_STATUS 3003
+
+// Label handles
+static HWND g_hLabelCPS    = nullptr;
+static HWND g_hLabelStatus = nullptr;
+
+// Log mutex
+static std::mutex g_LogMutex;
 
 // --------------------------------------------------
 // Logging helper
 // --------------------------------------------------
 void Log(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_LogMutex);
+    
     char timeBuf[64];
     std::time_t t = std::time(nullptr);
     std::tm tm;
@@ -148,13 +161,17 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 void CreateOverlayWindow(HWND hParent) {
     if (g_hOverlayWnd) return;
 
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc   = OverlayWndProc;
-    wc.hInstance     = g_hInst;
-    wc.lpszClassName = L"ClickOverlayClass";
-    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassW(&wc);
+    if (!g_OverlayClassRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc   = OverlayWndProc;
+        wc.hInstance     = g_hInst;
+        wc.lpszClassName = L"ClickOverlayClass";
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        if (RegisterClassW(&wc)) {
+            g_OverlayClassRegistered = true;
+        }
+    }
 
     int width  = 40;
     int height = 40;
@@ -177,8 +194,7 @@ void CreateOverlayWindow(HWND hParent) {
         nullptr
     );
 
-    ShowWindow(g_hOverlayWnd, SW_SHOW);
-    UpdateWindow(g_hOverlayWnd);
+    // Don't show initially - only show when clicking
 }
 
 void ShowClickOverlay() {
@@ -215,7 +231,8 @@ void MaybeClick() {
         return;
 
     // Schedule next click
-    double baseInterval = 1.0 / (double)g_CPS;
+    int cps = g_CPS.load();
+    double baseInterval = 1.0 / (double)cps;
     double jitterRange  = baseInterval * g_RandomFactor;
 
     std::uniform_real_distribution<double> dist(-jitterRange, jitterRange);
@@ -282,6 +299,38 @@ void RemoveTrayIcon(HWND hwnd) {
 }
 
 // --------------------------------------------------
+// Helper to update CPS label
+// --------------------------------------------------
+void UpdateCPSLabel() {
+    if (g_hLabelCPS) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"CPS: %d", g_CPS);
+        SetWindowTextW(g_hLabelCPS, buf);
+    }
+}
+
+// --------------------------------------------------
+// Helper to update status label
+// --------------------------------------------------
+void UpdateStatusLabel() {
+    if (g_hLabelStatus) {
+        const wchar_t* status = L"Mode: Idle";
+        if (g_ToggleMode) status = L"Mode: Toggle (ON)";
+        else if (g_HoldMode) status = L"Mode: Hold (ON)";
+        SetWindowTextW(g_hLabelStatus, status);
+    }
+
+    // Show/hide overlay based on mode
+    if (g_hOverlayWnd) {
+        if (g_ToggleMode || g_HoldMode) {
+            ShowWindow(g_hOverlayWnd, SW_SHOW);
+        } else {
+            ShowWindow(g_hOverlayWnd, SW_HIDE);
+        }
+    }
+}
+
+// --------------------------------------------------
 // GUI (main window) with CPS slider
 // --------------------------------------------------
 LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -289,16 +338,35 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE: {
         InitCommonControls();
 
+        // CPS Label (above slider)
+        g_hLabelCPS = CreateWindowExW(
+            0, L"STATIC", L"CPS: 12",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, 10, 80, 20,
+            hwnd, (HMENU)ID_LABEL_CPS, g_hInst, nullptr
+        );
+
         HWND hSlider = CreateWindowExW(
             0, TRACKBAR_CLASSW, L"",
             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
-            10, 10, 260, 40,
+            10, 30, 260, 40,
             hwnd, (HMENU)ID_SLIDER_CPS, g_hInst, nullptr
         );
 
         SendMessage(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(1, 200));
         SendMessage(hSlider, TBM_SETPOS, TRUE, g_CPS);
         SendMessage(hSlider, TBM_SETTICFREQ, 10, 0);
+
+        // Status Label (below slider)
+        g_hLabelStatus = CreateWindowExW(
+            0, L"STATIC", L"Mode: Idle",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            10, 75, 260, 20,
+            hwnd, (HMENU)ID_LABEL_STATUS, g_hInst, nullptr
+        );
+
+        UpdateCPSLabel();
+        UpdateStatusLabel();
 
         return 0;
     }
@@ -308,6 +376,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             int pos = (int)SendMessage((HWND)lParam, TBM_GETPOS, 0, 0);
             if (pos < 1) pos = 1;
             g_CPS = pos;
+            UpdateCPSLabel();
             std::ostringstream oss;
             oss << "CPS set to " << g_CPS;
             Log(oss.str());
@@ -327,13 +396,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_HOTKEY: {
         if (wParam == ID_HOTKEY_F13) {
             g_ToggleMode = !g_ToggleMode;
-            g_HoldMode = false; // optional: disable hold mode
+            g_HoldMode = false;
+            UpdateStatusLabel();
             std::string s = std::string("F13 toggle mode -> ") + (g_ToggleMode ? "ON" : "OFF");
             Log(s);
         } else if (wParam == ID_HOTKEY_F14) {
-            // Hold mode is active while F14 is down; but we can use toggle semantics here
             g_HoldMode = !g_HoldMode;
-            g_ToggleMode = false; // optional
+            g_ToggleMode = false;
+            UpdateStatusLabel();
             std::string s = std::string("F14 hold mode -> ") + (g_HoldMode ? "ON" : "OFF");
             Log(s);
         }
@@ -377,7 +447,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         CLASS_NAME,
         L"AutoClicker Control Panel",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 300, 120,
+        CW_USEDEFAULT, CW_USEDEFAULT, 300, 150,
         nullptr,
         nullptr,
         hInstance,
@@ -432,6 +502,9 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         g_hOverlayWnd = nullptr;
     }
 
-    DestroyWindow(g_hMainWnd);
+
+
+
+}    return 0;    DestroyWindow(g_hMainWnd);
     return 0;
 }

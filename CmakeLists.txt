@@ -1,0 +1,14 @@
+cmake_minimum_required(VERSION 3.10)
+
+# Project name
+project(AutoPunto)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Add the source file
+add_executable(AutoPunto AutoPunto.cpp)
+
+# Link required libraries
+target_link_libraries(AutoPunto user32 gdi32 shell32 comctl32)
